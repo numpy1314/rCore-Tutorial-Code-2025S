@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
-"""Archive a privacy-filtered coding-agent conversation as readable Markdown."""
+"""Archive a privacy-filtered coding-agent conversation as structured JSONL."""
 
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
-import shlex
-import subprocess
 import sys
 import tempfile
-from datetime import datetime
-from html import escape
+from datetime import datetime, timezone
 from itertools import chain
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 
-ARCHIVE_DIR_NAME = ".agent-sessions"
+ARCHIVE_DIR_NAME = ".ai/agent-sessions"
 CONFIG_RELATIVE_PATHS = {
-    "codex": Path(".codex") / "langfuse.json",
-    "claude-code": Path(".claude") / "settings.local.json",
+    "codex": Path(".codex") / "session-archive.json",
+    "claude-code": Path(".claude") / "session-archive.json",
+    "cursor": Path(".cursor") / "session-archive.json",
+    "vscode-copilot": Path(".vscode") / "session-archive.json",
+    "opencode": Path(".opencode") / "session-archive.json",
 }
-CLAUDE_MODE_ENV = "RCORE_SESSION_ARCHIVE_MODE"
 MODE_MESSAGES = "messages"
 MODE_TOOL_CALLS = "tool-calls"
 MODE_FULL = "full"
@@ -30,45 +30,18 @@ SUPPORTED_MODES = frozenset({MODE_MESSAGES, MODE_TOOL_CALLS, MODE_FULL})
 SESSION_ID_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def find_repository_root(cwd: str) -> Optional[Path]:
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
+def find_project_root(cwd: str, agent_name: str) -> Optional[Path]:
+    """Use the nearest explicit project policy, including above chapter repos."""
+    path = Path(cwd)
+    if not path.is_absolute():
         return None
-
-    if result.returncode != 0:
-        return None
-
-    root = result.stdout.strip()
-    return Path(root).resolve() if root else None
-
-
-def is_rcore_repository(root: Path) -> bool:
-    config_path = root / ".codex" / "langfuse.json"
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        tags = config.get("tags", [])
-        if isinstance(tags, list) and any(
-            str(tag).lower() == "rcore" for tag in tags
-        ):
-            return True
-    except (OSError, json.JSONDecodeError, AttributeError):
-        pass
-
-    readme_path = root / "README.md"
-    try:
-        return "rCore-Tutorial-Code-2025S" in readme_path.read_text(
-            encoding="utf-8", errors="replace"
-        )[:4096]
-    except OSError:
-        return False
+    path = path.resolve()
+    for root in (path, *path.parents):
+        config_path = root / CONFIG_RELATIVE_PATHS[agent_name]
+        # A disabled or invalid nearer policy must never fall through to a parent.
+        if config_path.exists() or config_path.is_symlink():
+            return root
+    return None
 
 
 def safe_session_id(value: Any) -> Optional[str]:
@@ -78,37 +51,60 @@ def safe_session_id(value: Any) -> Optional[str]:
     return normalized[:160] or None
 
 
-def read_archive_mode(repository_root: Path, agent_name: str = "codex") -> str:
-    """Read this agent's project policy; setup alone handles legacy migration."""
+def archive_session_id(value: Any) -> Optional[str]:
+    normalized = safe_session_id(value)
+    if normalized is None:
+        return None
+    if normalized != value:
+        suffix = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+        return normalized[:100] + "-" + suffix
+    return normalized
+
+
+def prepare_archive_directory(repository_root: Path, agent_name: str) -> Path:
+    """Keep conversations under .ai without changing existing course-log permissions."""
+    data_root = repository_root / ".ai"
+    archive_root = repository_root / ARCHIVE_DIR_NAME
+    directory = archive_root / agent_name
+    for path in (data_root, archive_root, directory):
+        if path.is_symlink():
+            raise ValueError("refusing a symlink archive directory")
+        path.mkdir(mode=0o700, exist_ok=True)
+        if path != data_root:
+            path.chmod(0o700)
+    return directory
+
+
+def read_archive_config(repository_root: Path, agent_name: str) -> Optional[Dict[str, Any]]:
+    """Read only this agent's explicit, project-local opt-in on each callback."""
     config_path = repository_root / CONFIG_RELATIVE_PATHS[agent_name]
+    if config_path.parent.is_symlink() or config_path.is_symlink():
+        return None
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return MODE_MESSAGES
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError):
         print(
-            f"rcore-session-archive: cannot read {config_path}: {error}; "
-            f"using {MODE_MESSAGES!r}",
+            "rcore-session-archive: 无法读取项目归档配置，已跳过本次归档。",
             file=sys.stderr,
         )
-        return MODE_MESSAGES
-
-    if agent_name == "claude-code":
-        environment = config.get("env", {}) if isinstance(config, dict) else None
-        mode = (
-            environment.get(CLAUDE_MODE_ENV, MODE_MESSAGES)
-            if isinstance(environment, dict) else None
-        )
-    else:
-        mode = config.get("mode", MODE_MESSAGES) if isinstance(config, dict) else None
+        return None
+    if not isinstance(config, dict) or config.get("enabled") is not True:
+        return None
+    mode = config.get("mode", MODE_MESSAGES)
     if not isinstance(mode, str) or mode not in SUPPORTED_MODES:
         print(
-            f"rcore-session-archive: unsupported archive mode {mode!r}; "
-            f"using {MODE_MESSAGES!r}",
+            "rcore-session-archive: 归档等级无效，使用 messages。",
             file=sys.stderr,
         )
-        return MODE_MESSAGES
-    return mode
+        mode = MODE_MESSAGES
+    return {"enabled": True, "mode": mode}
+
+
+def read_archive_mode(repository_root: Path, agent_name: str = "codex") -> str:
+    config = read_archive_config(repository_root, agent_name)
+    return config["mode"] if config else MODE_MESSAGES
 
 
 def event_with_timestamp(record: Dict[str, Any], **fields: Any) -> Dict[str, Any]:
@@ -466,162 +462,63 @@ def filtered_events(
         yield from filter_record(record, mode)
 
 
-def decode_structured_text(value: Any) -> Any:
-    """Decode structured tool arguments without interpreting ordinary text."""
-    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
-        try:
-            return json.loads(value)
-        except (json.JSONDecodeError, RecursionError):
-            pass
-    return value
-
-
-def readable_values(value: Any) -> str:
-    """Render tool parameters as indented key/value text, not escaped JSON."""
-    if value is None:
-        return "空"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, dict):
-        lines = []
-        for key, item in value.items():
-            text = readable_values(item)
-            if "\n" in text or isinstance(item, (dict, list)):
-                lines.append(f"{key}:\n" + "\n".join(f"  {line}" for line in text.splitlines()))
-            else:
-                lines.append(f"{key}: {text}")
-        return "\n".join(lines) or "（无参数）"
+def sanitize_content(value: Any) -> Any:
+    """Keep structured text and attachment references, never embedded binary data."""
     if isinstance(value, list):
-        return "\n".join("- " + readable_values(item).replace("\n", "\n  ") for item in value)
-    return str(value)
-
-
-def content_text(content: Any) -> str:
-    """Extract visible text and attachment descriptions from agent content blocks."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content if content.strip() else ""
-    if isinstance(content, list):
-        return "\n\n".join(text for item in content if (text := content_text(item)))
-    if isinstance(content, dict):
-        block_type = content.get("type")
-        if block_type in {"image", "input_image", "image_url", "document", "input_audio", "audio"}:
-            label = "文档" if block_type == "document" else "音频" if "audio" in block_type else "图片"
-            name = content.get("title") or content.get("filename") or content.get("name")
-            source = content.get("source", {})
-            location = content.get("image_url") or content.get("url") or content.get("path")
+        return [sanitize_content(item) for item in value]
+    if isinstance(value, str) and value.startswith("data:"):
+        return "[binary attachment omitted]"
+    if not isinstance(value, dict):
+        return value
+    kind = value.get("type")
+    if kind in {"image", "input_image", "image_url", "document", "input_audio", "audio"}:
+        result = {"type": "attachment", "kind": kind}
+        for key in ("title", "filename", "name", "path", "url", "image_url"):
+            location = value.get(key)
             if isinstance(location, dict):
                 location = location.get("url")
-            if not location and isinstance(source, dict):
-                location = source.get("url")
-            description = f"[{label}附件" + (f"：{name}" if name else "") + "]"
             if isinstance(location, str) and not location.startswith("data:"):
-                description += " " + escape(location)
-            if block_type == "document" and isinstance(source, dict) and source.get("type") == "text":
-                description += "\n\n" + str(source.get("data", ""))
-            return description
-        for key in ("text", "thinking", "content", "output"):
-            if key in content:
-                return content_text(content[key])
-        return readable_values(content)
-    return str(content)
+                result[key] = location
+        source = value.get("source")
+        if isinstance(source, dict):
+            if isinstance(source.get("url"), str) and not source["url"].startswith("data:"):
+                result["url"] = source["url"]
+            if kind == "document" and source.get("type") == "text":
+                result["text"] = source.get("data", "")
+        return result
+    return {key: sanitize_content(item) for key, item in value.items()
+            if key not in {"encrypted_content", "signature"}}
 
 
-def code_block(text: str, language: str = "text") -> str:
-    # A tool result may itself contain fenced Markdown. A longer fence ensures
-    # the result cannot accidentally close the surrounding code block.
-    longest = max((len(match.group()) for match in re.finditer(r"`+", text)), default=0)
-    fence = "`" * max(3, longest + 1)
-    text = text.rstrip("\r\n")
-    return f"{fence}{language}\n{text}\n{fence}"
-
-
-def tool_output_text(value: Any) -> str:
-    value = decode_structured_text(value)
-    if isinstance(value, dict) and not value.get("type"):
-        content_key = next((key for key in ("content", "output") if key in value), None)
-        if content_key:
-            text = content_text(value[content_key])
-            remaining = {key: item for key, item in value.items() if key != content_key}
-            if remaining:
-                text += "\n\n" + readable_values(remaining)
-            return text
-    return content_text(value)
-
-
-def timestamp_text(value: Any) -> str:
-    if not isinstance(value, str) or not value:
-        return ""
+def utc_timestamp(value: Any = None) -> str:
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat(sep=" ", timespec="seconds")
-    except ValueError:
-        return value.replace("\n", " ").replace("\r", " ")
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else None
+        if stamp is None or stamp.tzinfo is None:
+            raise ValueError("missing timezone")
+    except (ValueError, OverflowError):
+        stamp = datetime.now(timezone.utc)
+    return stamp.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
-def tool_input_markdown(event: Dict[str, Any]) -> str:
-    value = next((event[key] for key in ("input", "arguments", "action", "command") if key in event), None)
-    value = decode_structured_text(value)
-    if value is None:
-        return "（无参数）"
-    if isinstance(value, dict):
-        command_key = next((key for key in ("cmd", "command") if key in value), None)
-        command = value.get(command_key) if command_key else None
-        if isinstance(command, list) and all(isinstance(part, str) for part in command):
-            command = shlex.join(command)
-        if isinstance(command, str):
-            text = "执行命令：\n\n" + code_block(command, "bash")
-            remaining = {key: item for key, item in value.items() if key != command_key}
-            if remaining:
-                text += "\n\n其他参数：\n\n" + code_block(readable_values(remaining))
-            return text
-    if "command" in event and isinstance(value, str):
-        return "执行命令：\n\n" + code_block(value, "bash")
-    return "工具输入：\n\n" + code_block(readable_values(value))
+def existing_archive(directory: Path, session_id: str) -> Optional[Path]:
+    pattern = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_" + re.escape(session_id) + r"\.jsonl$")
+    matches = [path for path in directory.glob(f"*_{session_id}.jsonl") if pattern.fullmatch(path.name)]
+    if len(matches) > 1:
+        raise ValueError("multiple archives for one session; preserve existing files")
+    return matches[0] if matches else None
 
 
-def event_markdown(event: Dict[str, Any], agent_label: str, tool_names: Dict[str, str]) -> str:
-    kind = event.get("type")
-    content = content_text(event.get("content"))
-    timestamp = timestamp_text(event.get("timestamp"))
-    title = ""
-    collapse = False
+def session_archive_path(directory: Path, session_id: str, started_at: str) -> Path:
+    existing = existing_archive(directory, session_id)
+    if existing is not None:
+        return existing
+    stamp = datetime.fromisoformat(utc_timestamp(started_at))
+    return directory / f"{stamp:%Y-%m-%d_%H-%M-%S}_{session_id}.jsonl"
 
-    if kind == "tool_call":
-        name = str(event.get("name") or event.get("tool_name") or event.get("tool_type") or "未命名工具")
-        call_id = event.get("call_id") or event.get("id")
-        if call_id:
-            tool_names[str(call_id)] = name
-        title = f"工具调用：{name}"
-        content = tool_input_markdown(event)
-        if call_id:
-            content = f"调用 ID：{escape(str(call_id))}\n\n{content}"
-    elif kind == "tool_result":
-        call_id = str(event.get("call_id") or "")
-        title = "工具输出：" + tool_names.get(call_id, call_id or "未命名工具")
-        if event.get("is_error"):
-            title += "（错误）"
-        content = tool_output_text(event.get("content")) or "（无文本输出）"
-        collapse = len(content) > 1200 or len(content.splitlines()) > 12
-        content = code_block(content)
-    elif kind == "message":
-        title = "用户" if event.get("role") == "user" else agent_label
-    elif kind in {"intermediate", "reasoning"}:
-        title = {
-            "system": "系统指令", "developer": "开发者指令",
-        }.get(event.get("role"), f"{agent_label} 中间输出")
-        if kind == "reasoning":
-            title = f"{agent_label} 推理摘要"
-        collapse = len(content) > 1200 or len(content.splitlines()) > 12
 
-    if not title or not content.strip():
-        return ""
-    title = title.replace("\n", " ").replace("\r", " ")
-    if collapse:
-        label = escape(title + (f" · {timestamp}" if timestamp else ""))
-        return f"<details>\n<summary>{label}</summary>\n\n{content}\n\n</details>\n\n"
-    metadata = f"时间：{timestamp}\n\n" if timestamp else ""
-    return f"### {escape(title)}\n\n{metadata}{content}\n\n"
+def session_header(agent_name: str, session_id: str, mode: str, started_at: str) -> Dict[str, Any]:
+    return {"type": "session", "schema_version": 1, "agent": agent_name,
+            "session_id": session_id, "started_at": utc_timestamp(started_at), "mode": mode}
 
 
 def write_archive(
@@ -631,58 +528,46 @@ def write_archive(
     mode: str,
     session_id: Optional[str] = None,
     last_assistant_message: Optional[str] = None,
+    started_at: Optional[str] = None,
 ) -> None:
-    """Stream one Markdown view; never write a second raw transcript copy."""
-    agent_label = "Codex" if agent_name == "codex" else "Claude Code"
+    """Stream a session header and mode-filtered events, one JSON object per line."""
     events = filtered_events(transcript_path, agent_name, mode, last_assistant_message)
     first_event = next(events, None)
-    started = timestamp_text(first_event.get("timestamp")) if first_event else ""
+    started = started_at or (first_event or {}).get("timestamp")
 
-    def write(text: str) -> None:
-        output_file.write(text.encode("utf-8"))
+    def write(value):
+        output_file.write((json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
 
-    write(f"# {agent_label} 会话记录\n\n")
-    write(f"会话 ID：{escape(session_id or transcript_path.stem)}\n\n")
-    if started:
-        write(f"开始时间：{started}\n\n")
-    write(f"归档等级：{mode}\n\n")
-
+    write(session_header(agent_name, session_id or transcript_path.stem, mode, started))
     turn = 0
     agent_has_responded = False
-    tool_names: Dict[str, str] = {}
-    wrote_event = False
     for event in chain([first_event], events) if first_event else ():
-        rendered = event_markdown(event, agent_label, tool_names)
-        if not rendered:
-            continue
         is_user = event.get("type") == "message" and event.get("role") == "user"
         is_context = event.get("role") in {"system", "developer"}
         if not is_context and (turn == 0 or (is_user and agent_has_responded)):
             turn += 1
-            write(f"## 第 {turn} 轮\n\n")
             agent_has_responded = False
-        write(rendered)
-        wrote_event = True
+        write({**sanitize_content(event), "turn": turn})
         if not is_user and not is_context:
             agent_has_responded = True
-    if not wrote_event:
-        write("本归档等级下暂无可保存的消息。\n")
 
 
 def archive_transcript(payload: Dict[str, Any]) -> None:
     transcript_value = payload.get("transcript_path")
-    session_id = safe_session_id(payload.get("session_id"))
+    raw_session_id = payload.get("session_id")
+    session_id = archive_session_id(raw_session_id)
     cwd = payload.get("cwd")
-
     if not isinstance(transcript_value, str) or not transcript_value or not session_id:
         return
     if not isinstance(cwd, str) or not cwd:
         return
-
-    repository_root = find_repository_root(cwd)
-    if repository_root is None or not is_rcore_repository(repository_root):
+    agent_name = "codex" if os.environ.get("PLUGIN_ROOT") else "claude-code"
+    repository_root = find_project_root(cwd, agent_name)
+    if repository_root is None:
         return
-
+    config = read_archive_config(repository_root, agent_name)
+    if config is None:
+        return
     transcript_path = Path(transcript_value).expanduser()
     try:
         transcript_path = transcript_path.resolve(strict=True)
@@ -690,59 +575,39 @@ def archive_transcript(payload: Dict[str, Any]) -> None:
         return
     if not transcript_path.is_file():
         return
-
-    agent_name = "codex" if os.environ.get("PLUGIN_ROOT") else "claude-code"
-    archive_mode = read_archive_mode(repository_root, agent_name)
-    # Stop can run before Claude flushes the final response to transcript_path.
-    # The official input carries that response directly. Do not reuse it for
-    # SessionEnd, an interrupted/error turn, a subagent, or a Codex hook.
-    last_assistant_message = (
-        payload.get("last_assistant_message")
-        if agent_name == "claude-code" and payload.get("hook_event_name") == "Stop"
-        else None
-    )
-    archive_root = repository_root / ARCHIVE_DIR_NAME
-    archive_dir = archive_root / agent_name
-    archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for directory in (archive_root, archive_dir):
-        try:
-            directory.chmod(0o700)
-        except OSError:
-            pass
-
-    destination = archive_dir / f"{session_id}.md"
-    file_descriptor, temporary_name = tempfile.mkstemp(
-        dir=archive_dir,
-        prefix=f".{session_id}.",
-        suffix=".tmp",
-    )
-    temporary_path = Path(temporary_name)
-
+    last_assistant_message = (payload.get("last_assistant_message")
+                              if agent_name == "claude-code" and payload.get("hook_event_name") == "Stop" else None)
+    archive_dir = prepare_archive_directory(repository_root, agent_name)
+    records = read_jsonl_records(transcript_path, allow_incomplete_tail=(
+        isinstance(last_assistant_message, str) and bool(last_assistant_message.strip())
+    ))
     try:
-        with os.fdopen(file_descriptor, "wb") as output_file:
-            write_archive(
-                transcript_path, output_file, agent_name, archive_mode, session_id,
-                last_assistant_message,
-            )
-            output_file.flush()
-            os.fsync(output_file.fileno())
-        temporary_path.chmod(0o600)
+        first_record = next(records, {})
+    finally:
+        records.close()
+    started_at = utc_timestamp(first_record.get("timestamp"))
+    destination = session_archive_path(archive_dir, session_id, started_at)
+    if destination.is_symlink() or destination.resolve() == transcript_path:
+        raise ValueError("refusing to replace a symlink or the source transcript")
+    if destination.exists():
+        # Keep the first archival timestamp even if source history is regenerated.
+        with destination.open(encoding="utf-8") as source:
+            header = json.loads(source.readline())
+        if not isinstance(header, dict) or header.get("type") != "session" or header.get("session_id") != raw_session_id:
+            raise ValueError("existing session archive has an invalid header")
+        started_at = header["started_at"]
+    descriptor, temporary_name = tempfile.mkstemp(dir=archive_dir, prefix=f".{session_id}.", suffix=".tmp")
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            write_archive(transcript_path, output, agent_name, config["mode"], raw_session_id,
+                          last_assistant_message, started_at)
+            output.flush()
+            os.fsync(output.fileno())
         os.replace(temporary_path, destination)
     except BaseException:
-        try:
-            temporary_path.unlink()
-        except OSError:
-            pass
+        temporary_path.unlink(missing_ok=True)
         raise
-
-    # Retire only this session's legacy archive after Markdown was safely saved.
-    # Never remove the agent's source transcript, a symlink, or another session.
-    legacy = archive_dir / f"{session_id}.jsonl"
-    if legacy.is_file() and not legacy.is_symlink() and legacy.resolve() != transcript_path:
-        try:
-            legacy.unlink()
-        except OSError as error:
-            print(f"rcore-session-archive: cannot remove legacy archive {legacy}: {error}", file=sys.stderr)
 
 
 def main() -> int:
@@ -751,9 +616,8 @@ def main() -> int:
         if not isinstance(payload, dict):
             raise ValueError("hook input must be a JSON object")
         archive_transcript(payload)
-    except (json.JSONDecodeError, OSError, ValueError) as error:
-        print(f"rcore-session-archive: {error}", file=sys.stderr)
-        return 1
+    except Exception as error:
+        print(f"rcore-session-archive: hook 未完成（{type(error).__name__}），请检查配置与源会话文件。", file=sys.stderr)
     return 0
 
 

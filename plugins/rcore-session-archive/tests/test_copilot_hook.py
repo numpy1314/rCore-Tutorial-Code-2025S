@@ -1,54 +1,50 @@
+"""Local archive regressions adapted from rCore-Tutorial-Code-2025S."""
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from archive_test_helpers import records, archive_text, event_count, turn_count, session_file
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 REPOSITORY = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(SCRIPTS))
 import copilot_hook as copilot
-
-
-def attrs(span):
-    return {item["key"]: item["value"] for item in span["attributes"]}
-
-
-def io_value(span, key):
-    value = attrs(span).get("langfuse.observation." + key)
-    return json.loads(value["stringValue"]) if value else None
-
 
 class CopilotHookTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.config_path = self.root / ".vscode/langfuse.json"
+        self.config_path = self.root / ".vscode/session-archive.json"
         self.config_path.parent.mkdir()
-        self.config = {"enabled": True, "mode": "messages", "public_key": "pk-lf-stu-20250001",
-                       "secret_key": "sk-lf-token-" + "a" * 40, "base_url": "https://gateway.example:8443", "user_id": "UNTRUSTED_ID"}
+        self.config = {"enabled": True, "mode": "messages"}
         self.save_config()
         self.source = self.root / "copilot-source.jsonl"
         self.records = []
         self.add("session.start", {"sessionId": "session", "version": 1, "producer": "copilot-agent", "context": {"cwd": str(self.root)}})
-        self.sender = mock.Mock(return_value=True)
-        self.archive = self.root / ".agent-sessions/vscode-copilot/session.md"
         patcher = mock.patch.object(copilot.time, "sleep")
         self.sleep = patcher.start()
         self.addCleanup(patcher.stop)
+
+
+    @property
+    def archive(self):
+        return session_file(self.root, "vscode-copilot", "session")
+
 
     def save_config(self, mode=None):
         if mode:
             self.config["mode"] = mode
         self.config_path.write_text(json.dumps(self.config))
+
 
     def add(self, kind, data):
         index = len(self.records)
@@ -56,8 +52,10 @@ class CopilotHookTests(unittest.TestCase):
                              "timestamp": (datetime(2026, 9, 6, 12, tzinfo=timezone.utc) + timedelta(seconds=index)).isoformat(), "type": kind, "data": data})
         self.flush()
 
+
     def flush(self):
         self.source.write_text("".join(json.dumps(record) + "\n" for record in self.records))
+
 
     def message(self, text, requests=None, reasoning=None):
         data = {"messageId": f"message-{len(self.records)}", "content": text, "toolRequests": requests or []}
@@ -65,11 +63,13 @@ class CopilotHookTests(unittest.TestCase):
             data["reasoningText"] = reasoning
         self.add("assistant.message", data)
 
+
     def event(self, name="Stop", **fields):
         payload = {"hook_event_name": name, "session_id": "session", "transcript_path": str(self.source),
                    "cwd": str(self.root), "timestamp": "2026-09-06T13:00:00+00:00", **fields}
-        copilot.handle(payload, self.root, self.sender)
+        copilot.handle(payload, self.root)
         return payload
+
 
     def add_turn(self, prompt="USER_INPUT", reply="FINAL_REPLY", tool=True):
         self.add("user.message", {"content": prompt, "attachments": []})
@@ -83,86 +83,81 @@ class CopilotHookTests(unittest.TestCase):
         self.message(reply)
         self.add("assistant.turn_end", {"turnId": "1" if tool else "0"})
 
-    def spans(self):
-        return [span for call in self.sender.call_args_list for span in call.args[1]]
 
-    def test_messages_only_on_disk_but_uploads_all_available_content(self):
+    def test_messages_mode_saves_only_user_and_final_content(self):
         self.add_turn()
         original = self.source.read_bytes()
         self.event()
-        text = self.archive.read_text()
+        text = archive_text(self.archive)
         self.assertIn("USER_INPUT", text)
         self.assertIn("FINAL_REPLY", text)
         for value in ("INTERMEDIATE_TEXT", "THINKING_TEXT", "COMMAND_TEXT", "OUTPUT_TEXT"):
-            for path in (self.root / ".agent-sessions").rglob("*"):
+            for path in (self.root / ".ai/agent-sessions").rglob("*"):
                 if path.is_file():
                     self.assertNotIn(value.encode(), path.read_bytes(), str(path))
-        self.assertEqual([], list((self.root / ".agent-sessions").rglob("*.json*")))
+        self.assertEqual([self.archive], list((self.root / ".ai/agent-sessions").rglob("*.jsonl")))
+        self.assertEqual([], list((self.root / ".ai/agent-sessions").rglob("*.md")))
         self.assertEqual(original, self.source.read_bytes())
-        spans = self.spans()
-        roots = [span for span in spans if "parentSpanId" not in span]
-        self.assertEqual(1, len(roots))
-        self.assertEqual([{"role": "user", "content": "USER_INPUT"}], io_value(roots[0], "input"))
-        self.assertEqual([{"role": "assistant", "content": "FINAL_REPLY"}], io_value(roots[0], "output"))
-        for value in ("INTERMEDIATE_TEXT", "THINKING_TEXT", "COMMAND_TEXT", "OUTPUT_TEXT"):
-            self.assertIn(value, json.dumps(spans))
-        self.assertTrue(all(span.get("parentSpanId", roots[0]["spanId"]) == roots[0]["spanId"] for span in spans))
-        self.assertEqual(1, len({span["traceId"] for span in spans}))
-        self.assertNotIn("UNTRUSTED_ID", json.dumps(spans))
-        self.assertNotIn("user.id", json.dumps(spans))
-        self.assertNotIn(self.config["secret_key"], json.dumps(spans))
-        self.assertEqual(0o600, self.archive.stat().st_mode & 0o777)
+
 
     def test_tool_calls_and_full_modes(self):
         self.add_turn()
         self.save_config("tool-calls")
         self.event()
-        text = self.archive.read_text()
-        self.assertIn("```bash\nprintf COMMAND_TEXT", text)
-        self.assertEqual(1, text.count("### 工具调用：run_in_terminal"))
+        text = archive_text(self.archive)
+        self.assertEqual({"command": "printf COMMAND_TEXT"}, next(item for item in records(self.archive) if item["type"] == "tool_call")["input"])
+        self.assertEqual(1, event_count(self.archive, "tool_call"))
         self.assertNotIn("OUTPUT_TEXT", text)
         self.assertNotIn("INTERMEDIATE_TEXT", text)
         self.save_config("full")
         self.event()
-        text = self.archive.read_text()
+        text = archive_text(self.archive)
         for value in ("INTERMEDIATE_TEXT", "THINKING_TEXT", "COMMAND_TEXT", "OUTPUT_TEXT"):
             self.assertIn(value, text)
-        self.assertEqual(1, text.count("### 工具调用：run_in_terminal"))
-        self.assertEqual(1, text.count("### 工具输出：run_in_terminal"))
+        self.assertEqual(1, event_count(self.archive, "tool_call"))
+        self.assertEqual(1, event_count(self.archive, "tool_result"))
         self.save_config("messages")
         self.event()
-        self.assertNotIn("OUTPUT_TEXT", self.archive.read_text())
-        self.assertNotIn("COMMAND_TEXT", self.archive.read_text())
+        self.assertNotIn("OUTPUT_TEXT", archive_text(self.archive))
+        self.assertNotIn("COMMAND_TEXT", archive_text(self.archive))
 
-    def test_stop_and_duplicate_transcript_entries_do_not_reupload(self):
+
+    def test_stop_and_duplicate_transcript_entries_keep_one_copy(self):
         self.add_turn()
         self.event()
         first = self.archive.read_bytes()
-        calls = self.sender.call_count
         self.event()
         self.records.append(self.records[-1])
         self.flush()
         self.event()
         self.assertEqual(first, self.archive.read_bytes())
-        self.assertEqual(calls, self.sender.call_count)
+
+    def test_date_filename_is_stable_across_turns(self):
+        self.add_turn()
+        self.event()
+        path = self.archive
+        self.assertEqual("2026-09-06_12-00-01_session.jsonl", path.name)
+        self.add_turn("another question", "another answer", tool=False)
+        self.event()
+        self.assertEqual(path, self.archive)
+        self.assertEqual(2, turn_count(path))
+
 
     def test_multiple_llm_rounds_are_one_user_turn_and_identical_user_turns_stay_distinct(self):
         self.add_turn()
         self.event()
         self.add_turn()
         self.event()
-        text = self.archive.read_text()
+        text = archive_text(self.archive)
         self.assertEqual(2, text.count("USER_INPUT"))
         self.assertEqual(2, text.count("FINAL_REPLY"))
-        self.assertEqual(2, text.count("## 第 "))
-        self.assertEqual(2, len({span["traceId"] for span in self.spans()}))
-        self.assertEqual(1, len({attrs(span)["langfuse.session.id"]["stringValue"] for span in self.spans()}))
+        self.assertEqual(2, turn_count(self.archive))
+
 
     def test_recreated_history_with_new_uuids_does_not_duplicate(self):
         self.add_turn()
         self.event()
         before = self.archive.read_bytes()
-        self.sender.reset_mock()
         for index, record in enumerate(self.records):
             record["id"] = f"replayed-{index}"
             record["parentId"] = f"replayed-{index-1}" if index else None
@@ -171,14 +166,13 @@ class CopilotHookTests(unittest.TestCase):
         self.flush()
         self.event()
         self.assertEqual(before, self.archive.read_bytes())
-        self.sender.assert_not_called()
+
 
     def test_official_history_replay_without_tool_results_retains_archive_and_accepts_new_turn(self):
         self.save_config("full")
         self.add_turn()
         self.event()
         original = self.archive.read_bytes()
-        self.sender.reset_mock()
         # Official _replayHistory emits assistant rounds and toolRequests, not
         # tool.execution_* entries. Every entry is assigned a new UUID.
         self.records = [record for record in self.records if not record["type"].startswith("tool.execution_")]
@@ -190,54 +184,38 @@ class CopilotHookTests(unittest.TestCase):
         self.flush()
         self.event(timestamp="2026-09-06T14:00:00Z")
         self.assertEqual(original, self.archive.read_bytes())
-        self.sender.assert_not_called()
         self.add_turn("NEW_PROMPT", "NEW_REPLY", tool=False)
         self.event(timestamp="2026-09-06T15:00:00Z")
-        self.assertIn("OUTPUT_TEXT", self.archive.read_text())
-        self.assertIn("NEW_REPLY", self.archive.read_text())
-        self.assertEqual(2, self.archive.read_text().count("## 第 "))
-        self.assertEqual(1, len(self.spans()))
+        self.assertIn("OUTPUT_TEXT", archive_text(self.archive))
+        self.assertIn("NEW_REPLY", archive_text(self.archive))
+        self.assertEqual(2, turn_count(self.archive))
+
 
     def test_enabling_on_an_existing_conversation_does_not_import_old_turns(self):
         self.add_turn("OLD_PRIVATE_PROMPT", "OLD_PRIVATE_REPLY", tool=False)
         self.add_turn("NEW_PROMPT", "NEW_REPLY", tool=False)
         self.event()
-        text = self.archive.read_text()
+        text = archive_text(self.archive)
         self.assertNotIn("OLD_PRIVATE", text)
-        self.assertNotIn("OLD_PRIVATE", json.dumps(self.spans()))
         self.assertIn("NEW_REPLY", text)
         self.add_turn("THIRD_PROMPT", "THIRD_REPLY", tool=False)
         self.event()
-        self.assertNotIn("OLD_PRIVATE", self.archive.read_text())
-        self.assertEqual(2, self.archive.read_text().count("## 第 "))
+        self.assertNotIn("OLD_PRIVATE", archive_text(self.archive))
+        self.assertEqual(2, turn_count(self.archive))
 
-    def test_session_start_and_empty_stop_create_no_archive_or_trace(self):
+
+    def test_session_start_and_empty_stop_create_no_archive(self):
         self.event("SessionStart")
         self.event()
-        self.assertFalse((self.root / ".agent-sessions").exists())
-        self.sender.assert_not_called()
+        self.assertFalse((self.root / ".ai/agent-sessions").exists())
+
 
     def test_user_prompt_must_be_the_current_transcript_prompt(self):
         self.add_turn("old", "old reply", tool=False)
         with self.assertRaisesRegex(copilot.TranscriptError, "最新用户输入"):
             self.event("UserPromptSubmit", prompt="not flushed new prompt")
         self.assertFalse(self.archive.exists())
-        self.sender.assert_not_called()
 
-    def test_new_reply_updates_same_root_id_and_source_timestamps(self):
-        self.add("user.message", {"content": "question"})
-        self.event("UserPromptSubmit", prompt="question")
-        first = [span for span in self.spans() if "parentSpanId" not in span][0]
-        self.add("assistant.turn_start", {"turnId": "0"})
-        self.message("LATEST_REPLY")
-        self.add("assistant.turn_end", {"turnId": "0"})
-        self.event()
-        last = [span for span in self.spans() if "parentSpanId" not in span][-1]
-        self.assertEqual(first["spanId"], last["spanId"])
-        self.assertEqual(first["traceId"], last["traceId"])
-        self.assertEqual(first["startTimeUnixNano"], last["startTimeUnixNano"])
-        self.assertGreater(int(last["endTimeUnixNano"]), int(first["endTimeUnixNano"]))
-        self.assertIn("LATEST_REPLY", self.archive.read_text())
 
     def test_hook_tool_result_fills_a_not_yet_flushed_transcript(self):
         self.save_config("full")
@@ -246,33 +224,22 @@ class CopilotHookTests(unittest.TestCase):
         self.message("running", [{"toolCallId": "call", "name": "run_in_terminal", "arguments": '{"command":"pwd"}', "type": "function"}])
         self.event("PreToolUse", tool_name="run_in_terminal", tool_use_id="call__vscode-3", tool_input={"command": "pwd"})
         self.event("PostToolUse", tool_name="run_in_terminal", tool_use_id="call__vscode-3", tool_input={"command": "pwd"}, tool_response="RESULT_FROM_HOOK")
-        self.assertIn("RESULT_FROM_HOOK", self.archive.read_text())
-        tool_spans = [span for span in self.spans() if span["name"] == "Bash"]
-        self.assertEqual(1, len({span["spanId"] for span in tool_spans}))
+        self.assertIn("RESULT_FROM_HOOK", archive_text(self.archive))
         self.add("tool.execution_start", {"toolCallId": "call", "toolName": "run_in_terminal", "arguments": {"command": "pwd"}})
         self.add("tool.execution_complete", {"toolCallId": "call", "success": True, "result": {"content": "RESULT_FROM_HOOK"}})
         self.add("assistant.turn_end", {"turnId": "0"})
         self.event()
-        self.assertEqual(1, self.archive.read_text().count("RESULT_FROM_HOOK"))
-        self.assertEqual(1, self.archive.read_text().count("### 工具调用：run_in_terminal"))
+        self.assertEqual(1, archive_text(self.archive).count("RESULT_FROM_HOOK"))
+        self.assertEqual(1, event_count(self.archive, "tool_call"))
 
-    def test_tool_errors_are_retained(self):
-        self.add_turn()
-        for record in self.records:
-            if record["type"] == "tool.execution_complete":
-                record["data"]["success"] = False
-        self.flush()
-        self.event()
-        self.assertEqual(2, next(span for span in self.spans() if span["name"] == "Bash")["status"]["code"])
 
     def test_missing_final_reply_does_not_use_intermediate_text_as_final(self):
         self.add_turn()
         self.records = self.records[:7]
         self.flush()
         self.event()
-        self.assertNotIn("INTERMEDIATE_TEXT", self.archive.read_text())
-        root = next(span for span in self.spans() if "parentSpanId" not in span)
-        self.assertEqual([], io_value(root, "output"))
+        self.assertNotIn("INTERMEDIATE_TEXT", archive_text(self.archive))
+
 
     def test_delayed_final_flush_is_retried(self):
         self.add("user.message", {"content": "question"})
@@ -282,8 +249,9 @@ class CopilotHookTests(unittest.TestCase):
             self.add("assistant.turn_end", {"turnId": "0"})
         self.sleep.side_effect = flush_later
         self.event()
-        self.assertIn("DELAYED_FINAL", self.archive.read_text())
+        self.assertIn("DELAYED_FINAL", archive_text(self.archive))
         self.assertEqual(1, self.sleep.call_count)
+
 
     def test_corrupt_or_unsupported_source_does_not_overwrite_archive(self):
         self.add_turn()
@@ -297,7 +265,8 @@ class CopilotHookTests(unittest.TestCase):
                 self.event()
             self.assertEqual(original, self.archive.read_bytes())
 
-    def test_stale_hook_cannot_roll_back_newer_markdown(self):
+
+    def test_stale_hook_cannot_roll_back_newer_jsonl(self):
         self.add_turn()
         self.event(timestamp="2026-09-06T14:00:00Z")
         original = self.archive.read_bytes()
@@ -305,6 +274,7 @@ class CopilotHookTests(unittest.TestCase):
         self.flush()
         self.event(timestamp="2026-09-06T13:00:00Z")
         self.assertEqual(original, self.archive.read_bytes())
+
 
     def test_newer_hook_with_truncated_source_reports_error_without_overwrite(self):
         self.add_turn()
@@ -316,6 +286,7 @@ class CopilotHookTests(unittest.TestCase):
             self.event(timestamp="2026-09-06T14:00:00Z")
         self.assertEqual(original, self.archive.read_bytes())
 
+
     def test_changed_user_order_is_detected_instead_of_overwriting_a_turn(self):
         self.add_turn()
         self.event()
@@ -326,29 +297,6 @@ class CopilotHookTests(unittest.TestCase):
             self.event()
         self.assertEqual(original, self.archive.read_bytes())
 
-    def test_network_failure_retries_from_source_without_json_outbox(self):
-        self.add_turn()
-        self.sender.return_value = False
-        self.event()
-        before = self.spans()
-        self.assertIn("FINAL_REPLY", self.archive.read_text())
-        self.sender.return_value = True
-        self.sender.reset_mock()
-        self.event()
-        self.assertEqual(before, self.spans())
-        self.sender.reset_mock()
-        self.event()
-        self.sender.assert_not_called()
-        self.assertEqual([], list(self.archive.parent.rglob("*.json*")))
-
-    def test_credentials_missing_still_saves_markdown(self):
-        self.config.pop("secret_key")
-        self.save_config()
-        self.add_turn()
-        with redirect_stderr(io.StringIO()):
-            self.event()
-        self.assertIn("FINAL_REPLY", self.archive.read_text())
-        self.sender.assert_not_called()
 
     def test_scope_disabled_and_other_agent_configs_do_not_activate(self):
         self.add_turn()
@@ -359,18 +307,17 @@ class CopilotHookTests(unittest.TestCase):
         self.event()
         self.config_path.unlink()
         (self.root / ".cursor").mkdir()
-        (self.root / ".cursor/langfuse.json").write_text('{"enabled":true,"mode":"full"}')
+        (self.root / ".cursor/session-archive.json").write_text('{"enabled":true,"mode":"full"}')
         self.event()
         self.assertFalse(self.archive.exists())
-        self.sender.assert_not_called()
+
 
     def test_concurrent_identical_callbacks_keep_one_copy(self):
         self.add_turn()
         with ThreadPoolExecutor(max_workers=4) as workers:
             list(workers.map(lambda _: self.event(), range(8)))
-        self.assertEqual(1, self.archive.read_text().count("FINAL_REPLY"))
-        roots = [span for span in self.spans() if "parentSpanId" not in span]
-        self.assertEqual(1, len({span["spanId"] for span in roots}))
+        self.assertEqual(1, archive_text(self.archive).count("FINAL_REPLY"))
+
 
     def test_real_cli_fails_open_without_printing_source_content(self):
         result = subprocess.run([sys.executable, str(SCRIPTS / "copilot_hook.py")], input='{"secret":"DO_NOT_LOG",', text=True, capture_output=True)
@@ -402,29 +349,37 @@ class CopilotSetupTests(unittest.TestCase):
             self.assertIn(value, updated)
         self.assertEqual(updated, copilot.set_jsonc(updated, ["chat.hookFilesLocations", copilot.HOOK_LOCATION], True))
 
+
     def test_jsonc_insertion_handles_empty_comments_bom_and_no_trailing_comma(self):
         for source in ('{}', '{/* only comment */}', '\ufeff{\n"other":42 // end comment\n}', '{"other": {"inner":[1,2,],},}'):
             with self.subTest(source=source):
                 updated = copilot.set_jsonc(source, ["chat.useHooks"], True)
                 self.assertTrue(copilot.jsonc_object(updated)[0]["chat.useHooks"])
 
+
     def test_invalid_config_is_not_replaced_and_installer_reports_failure(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            (root / ".vscode").mkdir()
-            path = root / ".vscode/settings.json"
-            for source in ('{"broken":', '{"duplicate":1,"duplicate":2}', '[]', '{"chat.hookFilesLocations": false}'):
+            (root / ".ai/ide").mkdir(parents=True)
+            path = root / ".ai/ide/course.code-workspace"
+            for source in ('{"broken":', '{"duplicate":1,"duplicate":2}', '[]', '{"settings":{"chat.hookFilesLocations": false}}'):
                 path.write_text(source)
                 result = subprocess.run([sys.executable, str(SCRIPTS / "copilot_hook.py"), "--install", str(root)], text=True, capture_output=True)
                 self.assertNotEqual(0, result.returncode)
                 self.assertEqual(source, path.read_text())
                 self.assertFalse((root / ".vscode/rcore-hooks").exists())
 
+
     def test_installer_matches_template_and_preserves_unrelated_hooks(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            chapter_settings = root / ".vscode/settings.json"
+            chapter_settings.parent.mkdir()
+            chapter_text = '{\n// chapter Rust preferences\n"rust-analyzer.cargo.target":"riscv64gc-unknown-none-elf"\n}\n'
+            chapter_settings.write_text(chapter_text)
             copilot.install_hooks(root)
-            settings = (root / ".vscode/settings.json").read_bytes()
+            settings = (root / ".ai/ide/course.code-workspace").read_bytes()
+            self.assertEqual(chapter_text, chapter_settings.read_text())
             path = root / copilot.HOOK_LOCATION
             expected = json.loads((REPOSITORY / ".vscode/copilot-hooks.example.json").read_text())
             self.assertEqual(expected, json.loads(path.read_text()))
@@ -435,42 +390,23 @@ class CopilotSetupTests(unittest.TestCase):
             once = path.read_bytes()
             copilot.install_hooks(root)
             self.assertEqual(once, path.read_bytes())
-            self.assertEqual(settings, (root / ".vscode/settings.json").read_bytes())
+            self.assertEqual(settings, (root / ".ai/ide/course.code-workspace").read_bytes())
+            self.assertEqual(chapter_text, chapter_settings.read_text())
+            workspace = json.loads(settings)
+            self.assertTrue(workspace['settings']['chat.useHooks'])
+            self.assertTrue(workspace['settings']['chat.hookFilesLocations']['.github/hooks'])
             self.assertEqual("unrelated", json.loads(once)["hooks"]["Stop"][0]["command"])
             self.assertNotIn("otel", settings.decode())
-            for name in ("archive_session.py", "cursor_hook.py", "copilot_hook.py"):
+            for name in ("archive_session.py", "archive_storage.py", "copilot_hook.py"):
                 self.assertEqual((SCRIPTS / name).read_bytes(), (root / ".vscode/rcore-hooks" / name).read_bytes())
 
-    def test_setup_imports_token_and_preserves_independent_mode(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "project with spaces"
-            (root / ".vscode").mkdir(parents=True)
-            (root / ".vscode/langfuse.example.json").write_bytes((REPOSITORY / ".vscode/langfuse.example.json").read_bytes())
-            path = root / ".vscode/langfuse.json"
-            path.write_text('{"mode":"tool-calls","user_id":"not-trusted"}')
-            credential = Path(temp) / "token.json"
-            token = {"student_id": "20250001", "public_key": "pk-lf-stu-20250001", "secret_key": "sk-lf-token-" + "z" * 40, "base_url": "https://gateway.example:8443"}
-            credential.write_text(json.dumps(token))
-            for _ in range(2):
-                result = subprocess.run(["bash", "-c", 'source "$1"\nREPOSITORY_ROOT="$2"\nCREDENTIAL_FILE="$3"\nsetup_vscode\nprint_summary',
-                                         "copilot-test", str(REPOSITORY / "scripts/setup-agent-plugins.sh"), str(root), str(credential)], text=True, capture_output=True, timeout=15)
-                self.assertEqual(0, result.returncode, result.stderr)
-                self.assertIn("VS Code Copilot 留档等级：tool-calls", result.stdout)
-                self.assertNotIn(token["secret_key"], result.stdout + result.stderr)
-            config = json.loads(path.read_text())
-            self.assertEqual("tool-calls", config["mode"])
-            self.assertEqual(token["secret_key"], config["secret_key"])
-            self.assertNotIn("user_id", config)
-            self.assertEqual(0o600, path.stat().st_mode & 0o777)
-            for name in (".codex", ".claude", ".cursor", ".agents"):
-                self.assertFalse((root / name).exists())
 
     def test_cached_script_runs_with_no_plugin_source(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             copilot.install_hooks(root)
-            (root / ".vscode/langfuse.json").write_text('{"enabled":true,"mode":"messages"}')
+            (root / ".vscode/session-archive.json").write_text('{"enabled":true,"mode":"messages"}')
             source = root / "source.jsonl"
             data = [
                 ("session.start", {"sessionId": "cached", "version": 1, "producer": "copilot-agent"}),
@@ -487,16 +423,15 @@ class CopilotSetupTests(unittest.TestCase):
             self.assertEqual(0, result.returncode)
             self.assertEqual({}, json.loads(result.stdout))
             self.assertFalse((root / "plugins").exists())
-            archive = (root / ".agent-sessions/vscode-copilot/cached.md").read_text()
+            archive = archive_text(session_file(root, "vscode-copilot", "cached"))
             self.assertIn("CACHED_PROMPT", archive)
             self.assertIn("CACHED_REPLY", archive)
 
+
     def test_private_files_ignored_and_template_is_not(self):
-        result = subprocess.run(["git", "check-ignore", ".vscode/settings.json", ".vscode/langfuse.json", ".vscode/rcore-hooks/hooks.json", ".agent-sessions/vscode-copilot/session.md"], cwd=REPOSITORY, text=True, capture_output=True)
-        self.assertEqual(4, len(result.stdout.splitlines()))
-        result = subprocess.run(["git", "check-ignore", ".vscode/langfuse.example.json", ".vscode/copilot-hooks.example.json"], cwd=REPOSITORY, capture_output=True)
+        result = subprocess.run(["git", "check-ignore", ".github/hooks/rcore-session-archive.json", ".vscode/session-archive.json", ".vscode/rcore-hooks/copilot_hook.py"], cwd=REPOSITORY, text=True, capture_output=True)
+        self.assertEqual(3, len(result.stdout.splitlines()))
+        result = subprocess.run(["git", "check-ignore", "--no-index", ".ai/agent-sessions/vscode-copilot/2026-09-09_00-00-00_session.jsonl", ".ai/agent-sessions/vscode-copilot/.state/session.sqlite3"], cwd=REPOSITORY, capture_output=True)
         self.assertEqual(1, result.returncode)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        result = subprocess.run(["git", "check-ignore", ".vscode/session-archive.example.json", ".vscode/copilot-hooks.example.json"], cwd=REPOSITORY, capture_output=True)
+        self.assertEqual(1, result.returncode)

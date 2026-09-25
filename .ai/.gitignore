@@ -1,0 +1,14 @@
+
+
+# Local recording runtime and client configuration.
+course-tools/
+ide/
+
+# >>> course-tool records
+!agent-sessions/
+!agent-sessions/**
+!events/
+!events/**
+!submissions/
+!submissions/**
+# <<< course-tool records

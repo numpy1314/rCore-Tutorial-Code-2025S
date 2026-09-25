@@ -1,7 +1,7 @@
 {
   "name": "rcore-session-archive",
-  "version": "0.3.3",
-  "description": "Archives readable Markdown conversations inside the local rCore checkout",
+  "version": "0.1.0",
+  "description": "Save coding-agent conversations as local JSONL in the project.",
   "author": {
     "name": "rCore Tutorial teaching team"
   }

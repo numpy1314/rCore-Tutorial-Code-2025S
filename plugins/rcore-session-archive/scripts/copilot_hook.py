@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""VS Code Copilot project hooks, transcript v1 -> Markdown + authenticated OTLP.
+"""VS Code Copilot project hooks: transcript v1 to local JSONL.
 
 The transcript contract is preview, not a stable API. Check the session header,
 never scan workspaceStorage, and fail open without replacing archives on errors.
 Use user-message ordinals, not assistant.turn_start IDs (which count LLM rounds).
-Only Markdown bodies and a content-free ordering/delivery index are persisted.
+Only JSONL bodies and a content-free ordering index are persisted.
 """
 
 import json
@@ -12,23 +12,23 @@ import re
 import sys
 import time
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-from archive_session import SUPPORTED_MODES, event_markdown, find_repository_root, safe_session_id
-from cursor_hook import (
-    atomic_write, digest, event_row, make_span, open_index, private_directory,
-    put_block, read_blocks, upload, valid_credentials, write_markdown,
+from archive_session import (
+    ARCHIVE_DIR_NAME, find_project_root, read_archive_config, archive_session_id,
+    prepare_archive_directory, existing_archive, session_archive_path,
+)
+from archive_storage import (
+    atomic_write, digest, event_row, open_index, private_directory,
+    put_entry, read_entries, write_jsonl,
 )
 
 
 AGENT = "vscode-copilot"
-LABEL = "VS Code Copilot"
-MARKER = "rcore-copilot"
 EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "Stop")
 COMMAND = 'python3 ".vscode/rcore-hooks/copilot_hook.py"'
-HOOK_LOCATION = ".vscode/rcore-hooks/hooks.json"
-SHELL_TOOLS = {"run_in_terminal", "run_terminal_command", "runTerminalCommand", "runCommand", "Shell", "Bash", "bash", "powershell"}
+HOOK_LOCATION = ".github/hooks/rcore-session-archive.json"
 
 
 class TranscriptError(ValueError):
@@ -36,7 +36,7 @@ class TranscriptError(ValueError):
 
 
 def warn(message):
-    print(f"[rCore VS Code Copilot] {message}", file=sys.stderr)
+    print(f"[Course VS Code Copilot] {message}", file=sys.stderr)
 
 
 def timestamp_ns(value):
@@ -202,17 +202,13 @@ def snapshot(path, payload, attempts=5):
     raise TranscriptError("无法读取 transcript，原留档未覆盖。") from None
 
 
-def export(config, spans):
-    return upload(config, spans, agent_name=AGENT)
-
-
-def handle(payload, project_root=None, sender=export):
+def handle(payload, project_root=None):
     if not isinstance(payload, dict) or payload.get("hook_event_name") not in EVENTS:
         return
     # Never interpret a Claude/Cursor hook merely because it has similarly named fields.
     if payload.get("hook_event_name") == "SessionStart":
-        return  # The first user entry is not yet logged here. No empty trace/history import.
-    root = project_root or find_repository_root(str(Path.cwd()))
+        return  # The first user entry is not yet logged here. No empty archive/history import.
+    root = project_root or find_project_root(str(Path.cwd()), AGENT)
     if root is None:
         return
     root = Path(root).resolve()
@@ -223,19 +219,10 @@ def handle(payload, project_root=None, sender=export):
         resolved = Path(cwd).resolve()
         if resolved != root and root not in resolved.parents:
             return
-    config_path = root / ".vscode/langfuse.json"
-    if config_path.parent.is_symlink() or config_path.is_symlink() or not config_path.is_file():
+    config = read_archive_config(root, AGENT)
+    if config is None:
         return
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(config, dict) or config.get("enabled") is not True:
-        return
-    mode = config.get("mode", "messages")
-    if not isinstance(mode, str) or mode not in SUPPORTED_MODES:
-        warn("归档等级无效，使用 messages。")
-        mode = "messages"
-    tags = config.get("tags", [])
-    if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
-        raise TranscriptError("Langfuse tags 必须是字符串数组。")
+    mode = config["mode"]
     session_id = payload.get("session_id")
     transcript = payload.get("transcript_path")
     if not isinstance(session_id, str) or not session_id or not isinstance(transcript, str) or not transcript:
@@ -266,17 +253,15 @@ def handle(payload, project_root=None, sender=export):
             set_result(current, identity, payload.get("tool_response"), stamp)
         current["ended"] = max(current["ended"], stamp)
 
-    sid = safe_session_id(session_id)
-    if sid != session_id:
-        sid = sid[:100] + "-" + digest(session_id)[:16]
-    directory = root / ".agent-sessions" / AGENT
-    archive = directory / f"{sid}.md"
+    sid = archive_session_id(session_id)
+    if sid is None:
+        return
+    directory = root / ARCHIVE_DIR_NAME / AGENT
     index = directory / ".state" / f"{sid}.sqlite3"
-    if archive.exists() and not index.exists():
-        raise TranscriptError("归档索引缺失；请与 Markdown 一起恢复 .state，原文件未覆盖。")
-    for path in (directory.parent, directory, index.parent):
-        private_directory(path)
-    jobs = []
+    if existing_archive(directory, sid) is not None and not index.exists():
+        raise TranscriptError("归档索引缺失；请与 JSONL 一起恢复 .state，原文件未覆盖。")
+    prepare_archive_directory(root, AGENT)
+    private_directory(index.parent)
     with closing(open_index(index)) as db:
         db.executescript("""
             CREATE TABLE IF NOT EXISTS copilot_source (
@@ -299,7 +284,9 @@ def handle(payload, project_root=None, sender=export):
                 previous_turn = db.execute("SELECT MAX(source_number) FROM copilot_source").fetchone()[0]
                 if records[0]["id"] == watermark["source_header"] or len(turns) < previous_turn:
                     raise TranscriptError("transcript 出现截断，保留原留档；若持续出现，请新建会话。")
-            blocks = read_blocks(archive, LABEL, MARKER)
+            started = datetime.fromtimestamp(current["started"] / 1_000_000_000, timezone.utc).isoformat()
+            archive = session_archive_path(directory, sid, started)
+            entries = read_entries(archive, AGENT, session_id)
             for source_turn in turns:
                 identity = digest(AGENT, session_id, source_turn["number"])
                 turn = db.execute("SELECT * FROM turns WHERE id=?", (identity,)).fetchone()
@@ -314,25 +301,13 @@ def handle(payload, project_root=None, sender=export):
                                (identity, source_turn["started"]))
                     turn = db.execute("SELECT * FROM turns WHERE id=?", (identity,)).fetchone()
                     db.execute("INSERT INTO copilot_source VALUES(?,?,?)", (identity, source_turn["number"], prompt_hash))
-                span_payload = {"conversation_id": session_id, "generation_id": str(source_turn["number"])}
 
                 def record(key, kind, event_data, started, ended, revision=None):
-                    row = event_row(db, turn, key, kind, digest(event_data, revision), ended, max(0, ended - started))
+                    event_row(db, turn, key, kind, digest(event_data, revision), ended, max(0, ended - started))
                     db.execute("UPDATE events SET kind=? WHERE id=?", (kind, key))
-                    blocks.pop(key, None)
+                    entries.pop(key, None)
                     if event_data and (kind in {"user", "reply"} or mode == "full" or (mode == "tool-calls" and kind in {"tool", "tool_pending"})):
-                        names = {call_id: value["event"]["name"] for call_id, value in source_turn["tools"].items()}
-                        put_block(blocks, key, [event_data], names, LABEL, MARKER)
-                    return row
-
-                def queue(row, name, kind, input_text=None, output_text=None, error="", is_root=False, tool_name=None):
-                    fingerprint = digest(name, kind, input_text, output_text, error)
-                    # Keep delivery hashes separate from the render hash stored on this row.
-                    if row["sent_hash"] != fingerprint:
-                        fields = {**span_payload, "tool_name": tool_name or name}
-                        span = make_span(config, fields, turn, row, name, kind, input_text, output_text, error,
-                                         is_root, agent_name=AGENT, agent_label=LABEL)
-                        jobs.append((row["id"], row["content_hash"], fingerprint, span))
+                        put_entry(entries, key, event_data)
 
                 user = {"type": "message", "role": "user", "content": source_turn["prompt"]}
                 record(digest(identity, "user"), "user", user, source_turn["started"], source_turn["started"])
@@ -349,37 +324,10 @@ def handle(payload, project_root=None, sender=export):
                     prior = db.execute("SELECT kind FROM events WHERE id=?", (key,)).fetchone()
                     if kind == "tool_pending" and prior and prior["kind"] == "tool":
                         continue  # A PostToolUse payload may precede its source JSONL flush.
-                    row = record(key, kind, event_data, item["started"], item["ended"], item.get("result"))
-                    if kind in {"tool", "tool_pending"}:
-                        name = event_data["name"]
-                        result = item["result"]
-                        queue(row, "Bash" if name in SHELL_TOOLS else name, "tool",
-                              event_markdown(event_data, LABEL, {}),
-                              event_markdown(result, LABEL, {event_data["call_id"]: name}) if result else None,
-                              "工具执行失败" if result and result.get("is_error") else "", tool_name=name)
-                    elif kind in {"intermediate", "reasoning"}:
-                        queue(row, "Copilot 推理摘要" if kind == "reasoning" else "Copilot 中间输出", "event", output_text=event_data["content"])
-                if source_turn["prompt"].strip() or reply:
-                    root_input = [{"role": "user", "content": source_turn["prompt"]}] if source_turn["prompt"].strip() else []
-                    root_output = [{"role": "assistant", "content": reply["event"]["content"]}] if reply else []
-                    row = event_row(db, turn, digest(identity, "root"), "root", digest(root_input, root_output),
-                                    source_turn["ended"], max(0, source_turn["ended"] - source_turn["started"]))
-                    queue(row, "VS Code Copilot Turn", "generation", root_input, root_output, is_root=True)
-            write_markdown(archive, db, blocks, mode, sid, LABEL, MARKER)
+                    record(key, kind, event_data, item["started"], item["ended"], item.get("result"))
+            write_jsonl(archive, db, entries, mode, session_id, AGENT)
             db.execute("INSERT OR REPLACE INTO copilot_watermark VALUES(1,?,?,?)",
                        (len(records), hook_stamp, records[0]["id"]))
-
-        if jobs and valid_credentials(config):
-            # The source transcript is the retry source. No second raw upload queue is saved.
-            for offset in range(0, len(jobs), 50):
-                batch = jobs[offset:offset + 50]
-                if not sender(config, [job[3] for job in batch]):
-                    break
-                with db:
-                    for key, render_hash, sent_hash, _span in batch:
-                        db.execute("UPDATE events SET sent_hash=? WHERE id=? AND content_hash=?", (sent_hash, key, render_hash))
-        elif jobs:
-            warn("缺少有效学生凭据，仅保存本地 Markdown；请重新运行 vscode 配置并传入 token JSON。")
 
 
 def jsonc_object(text):
@@ -465,20 +413,24 @@ def hook_config(existing=None):
 def install_hooks(root):
     directory = root / ".vscode"
     runtime = directory / "rcore-hooks"
-    settings = directory / "settings.json"
-    hooks = runtime / "hooks.json"
-    for path in (directory, runtime, settings, hooks):
+    settings = root / ".ai/ide/course.code-workspace"
+    hooks = root / HOOK_LOCATION
+    for path in (directory, runtime, root / ".ai", settings.parent, settings,
+                 root / ".github", hooks.parent, hooks):
         if path.is_symlink():
             raise TranscriptError("VS Code 项目配置不能是符号链接，以免写入项目外部。")
     source = settings.read_text(encoding="utf-8") if settings.exists() else "{}\n"
-    updated = set_jsonc(source, ["chat.useHooks"], True)
-    updated = set_jsonc(updated, ["chat.hookFilesLocations", HOOK_LOCATION], True)
+    updated = set_jsonc(source, ["folders"], [{"name": root.name, "path": "../.."}])
+    updated = set_jsonc(updated, ["settings", "chat.useHooks"], True)
+    updated = set_jsonc(updated, ["settings", "chat.hookFilesLocations", ".github/hooks"], True)
     config = hook_config(json.loads(hooks.read_text(encoding="utf-8")) if hooks.exists() else None)
-    # Validate all configuration before installing any files. Preserve unrelated
-    # JSONC settings/comments and global hooks; do not enable application-wide OTel.
+    # Keep configuration outside the chapter branches' tracked settings.json.
+    # The standard hook location and installed runtime survive git switch.
     directory.mkdir(parents=True, exist_ok=True)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    hooks.parent.mkdir(parents=True, exist_ok=True)
     private_directory(runtime)
-    for name in ("archive_session.py", "cursor_hook.py", "copilot_hook.py"):
+    for name in ("archive_session.py", "archive_storage.py", "copilot_hook.py"):
         atomic_write(runtime / name, (Path(__file__).resolve().parent / name).read_text(encoding="utf-8"))
     atomic_write(hooks, json.dumps(config, ensure_ascii=False, indent=2) + "\n")
     if updated != source or not settings.exists():
